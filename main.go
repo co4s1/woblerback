@@ -137,7 +137,7 @@ func main() {
 		// Get allowed origin from environment variable, with a fallback for local testing
 		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 		if allowedOrigin == "" {
-			allowedOrigin = "https://wobler.netlify.app/" // Change to your actual frontend URL
+			allowedOrigin = "https://wobler.netlify.app" // Change to your actual frontend URL
 		}
 
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
