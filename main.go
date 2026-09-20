@@ -134,9 +134,15 @@ func main() {
 	godotenv.Load()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Get allowed origin from environment variable, with a fallback for local testing
+		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+		if allowedOrigin == "" {
+			allowedOrigin = "https://wobler.netlify.app/" // Change to your actual frontend URL
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		switch r.Method {
 		case http.MethodOptions:
@@ -148,6 +154,10 @@ func main() {
 		}
 	})
 
-	fmt.Println("Server starting on :8080")
-	http.ListenAndServe(":8080", mux)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Println("Server starting on :" + port)
+	http.ListenAndServe(":"+port, mux)
 }
