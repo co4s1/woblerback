@@ -5,15 +5,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"time"
 	"os"
+	"time"
+	"github.com/joho/godotenv"
 )
 
 type ChatRequest struct {
 	Prompt string `json:"prompt"`
 }
-// Handler for POST /chat
+
+type RunPodResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Output struct {
+		Output string `json:"output"`
+		Error  string `json:"error"`
+	} `json:"output"`
+}
+
 func chatWithWoble(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -31,82 +42,96 @@ func chatWithWoble(w http.ResponseWriter, r *http.Request) {
 
 	apiKey := os.Getenv("RUNPOD_KEY")
 	endpointID := "qyjxyr0boao2ry"
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second}
 
-	// 1. Submit the job (returns immediately with an id)
-	submitReq, _ := http.NewRequest(http.MethodPost,
-		"https://api.runpod.ai/v2/"+endpointID+"/run",
+	runReq, _ := http.NewRequest(http.MethodPost,
+		"https://api.runpod.ai/v2/"+endpointID+"/runsync",
 		bytes.NewBuffer(postBody))
-	submitReq.Header.Set("Content-Type", "application/json")
-	submitReq.Header.Set("Authorization", "Bearer "+apiKey)
+	runReq.Header.Set("Content-Type", "application/json")
+	runReq.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := client.Do(submitReq)
+	resp, err := client.Do(runReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	log.Printf("runpod runsync: status=%d body=%s", resp.StatusCode, body)
 
-	var submitResp struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&submitResp); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, fmt.Sprintf("runpod returned status %d", resp.StatusCode), http.StatusBadGateway)
 		return
 	}
 
-	// 2. Poll for the result
-	statusURL := "https://api.runpod.ai/v2/" + endpointID + "/status/" + submitResp.ID
-	deadline := time.Now().Add(5 * time.Minute) // generous cold-start budget
-
-	type RunPodResponse struct {
-		Status string `json:"status"`
-		Output struct {
-			Output string `json:"output"`
-			Error  string `json:"error"`
-		} `json:"output"`
+	var rpResp RunPodResponse
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&rpResp); err != nil {
+		http.Error(w, "unexpected response from generation service", http.StatusBadGateway)
+		return
 	}
 
+	// runsync didn't finish in its own wait window (cold start) — poll the same job by id
+	if rpResp.Status != "COMPLETED" && rpResp.Status != "FAILED" {
+		if rpResp.ID == "" {
+			http.Error(w, "job did not complete and no id was returned: "+string(body), http.StatusGatewayTimeout)
+			return
+		}
+		rpResp, err = pollRunPod(client, endpointID, apiKey, rpResp.ID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusGatewayTimeout)
+			return
+		}
+	}
+
+	if rpResp.Status == "FAILED" {
+		http.Error(w, "job failed: "+rpResp.Output.Error, http.StatusBadGateway)
+		return
+	}
+	if rpResp.Output.Error != "" {
+		http.Error(w, rpResp.Output.Error, http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"reply": rpResp.Output.Output})
+}
+
+func pollRunPod(client *http.Client, endpointID, apiKey, id string) (RunPodResponse, error) {
+	statusURL := "https://api.runpod.ai/v2/" + endpointID + "/status/" + id
+	deadline := time.Now().Add(3 * time.Minute)
+
 	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+
 		statusReq, _ := http.NewRequest(http.MethodGet, statusURL, nil)
 		statusReq.Header.Set("Authorization", "Bearer "+apiKey)
 
 		sResp, err := client.Do(statusReq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
+			return RunPodResponse{}, err
 		}
 		body, _ := io.ReadAll(sResp.Body)
 		sResp.Body.Close()
 
-		var rpResp RunPodResponse
-		if err := json.Unmarshal(body, &rpResp); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		if sResp.StatusCode != http.StatusOK {
+			log.Printf("runpod poll: status=%d body=%s", sResp.StatusCode, body)
+			continue
 		}
 
-		switch rpResp.Status {
-		case "COMPLETED":
-			if rpResp.Output.Error != "" {
-				http.Error(w, rpResp.Output.Error, http.StatusBadGateway)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"reply": rpResp.Output.Output})
-			return
-		case "FAILED":
-			http.Error(w, "job failed: "+string(body), http.StatusBadGateway)
-			return
-		default: // IN_QUEUE, IN_PROGRESS
-			time.Sleep(2 * time.Second)
+		var rpResp RunPodResponse
+		if err := json.NewDecoder(bytes.NewReader(body)).Decode(&rpResp); err != nil {
+			continue
+		}
+		if rpResp.Status == "COMPLETED" || rpResp.Status == "FAILED" {
+			return rpResp, nil
 		}
 	}
 
-	http.Error(w, "job timed out waiting for RunPod", http.StatusGatewayTimeout)
+	return RunPodResponse{}, fmt.Errorf("job timed out waiting for RunPod")
 }
 
-
 func main() {
+	godotenv.Load()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -122,7 +147,6 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-
 
 	fmt.Println("Server starting on :8080")
 	http.ListenAndServe(":8080", mux)
